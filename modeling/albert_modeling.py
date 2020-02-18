@@ -129,9 +129,9 @@ class AlbertMultiHeadAttention(nn.Module):
 		return x.view(*s[:-n_dims], -1)
 	
 	def forward(self, x):
-		q = self.query(x)
-		k = self.key(x)
-		v = self.value(x)
+		q = self.query(x)   # (B, M, H)
+		k = self.key(x)     # (B, M, H)
+		v = self.value(x)   # (B, M, H)
 		q, k, v = list(map(lambda x: self.split_tensor(x).transpose(1,2), [q, k, v]))
 
 		score = (q @ k.transpose(-2,-1)) / np.sqrt(self.attention_size)
