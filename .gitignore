@@ -2,4 +2,4 @@ env
 env_noattention
 data
 korean-parallel-corpora/korean-english-news-v1/training_checkpoints
-dataset
+#dataset
