@@ -4,8 +4,6 @@ import glob
 import string
 import pandas as pd
 
-path = '/home/jkfirst/workspace/git/LaH/dataset'
-
 # perform basic cleaning
 exclude = set(string.punctuation) # Set of all special characters
 remove_digits = str.maketrans('', '', string.digits) # Set of all digits
@@ -30,7 +28,7 @@ def preprocess_eng_sentence(sent):
 	sent = '<start> ' + sent + ' <end>'
 	return sent
 
-def load_dataset_kaist():
+def load_dataset_kaist(path):
 	files = glob.glob(os.path.join(path, 'Corpus10', 'cekcorpus*.txt'))
 	sent_pairs_list = []
 	for corpus in files:
@@ -64,7 +62,7 @@ def load_dataset_kaist():
 		sent_pairs_list.extend(sent_pairs)
 	return sent_pairs_list
 
-def load_dataset_kaggle():
+def load_dataset_kaggle(path):
 	# Generate pairs of cleaned English and Marathi sentences
 	sent_pairs = []
 	df = pd.read_csv(os.path.join(path, 'kaggle', 'kor_eng.csv'), encoding='cp949')
@@ -89,10 +87,10 @@ load_f_list = [
 	load_dataset_kaggle,
 ]
 
-def load_dataset():
+def load_dataset(path='/home/jkfirst/workspace/git/LaH/dataset'):
 	sent_pairs_list = []
 	for load_f in load_f_list:
-		sent_pairs_list.extend(load_f())
+		sent_pairs_list.extend(load_f(path))
 		print('>> {} sentence pairs loaded'.format(len(sent_pairs_list)))
 	return sent_pairs_list
 
