@@ -1,5 +1,11 @@
 env
 env_noattention
+env_las
 data
 korean-parallel-corpora/korean-english-news-v1/training_checkpoints
 #dataset
+**/*.model
+**/*.vocab
+**/*.txt
+**/.ipynb_checkpoints/
+**/__pycache__
