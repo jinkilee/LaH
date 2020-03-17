@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, '../')
 
 import os
+from tqdm import tqdm, trange
 import glob
 import setting
 import numpy as np
@@ -106,13 +107,16 @@ def set_padding(dataset_list):
 	trg_token_tensor = pad_sequence(trg_token_list, batch_first=True)
 	src_mask_tensor = pad_sequence(src_mask_list, batch_first=True).unsqueeze(dim=-2)
 	trg_mask_tensor = pad_sequence(trg_mask_list, batch_first=True).unsqueeze(dim=-2)
-	
+
+	src_token_tensor.to()	
 	return [src_token_tensor, trg_token_tensor, src_mask_tensor, trg_mask_tensor, ntokens]
 
 class TranslationDataset(Dataset):
-	def __init__(self, sent_pairs):
+	def __init__(self, sent_pairs, src_spm, trg_spm):
 		self.dataset = sent_pairs
-	
+		self.src_spm = src_spm
+		self.trg_spm = trg_spm
+
 	def __len__(self):
 		return len(self.dataset)
 	
@@ -120,11 +124,11 @@ class TranslationDataset(Dataset):
 		src, trg = self.dataset[idx]
 		
 		# to Tensor
-		inp_tensor = torch.LongTensor(src_spm.EncodeAsIds(src))#.unsqueeze(dim=0)
-		out_tensor = torch.LongTensor(trg_spm.EncodeAsIds(trg))#.unsqueeze(dim=0)
-		src_mask = (inp_tensor != src_spm.pad_id()).int()
-		trg_mask = (out_tensor != trg_spm.pad_id()).int()
-		ntokens = (out_tensor != trg_spm.pad_id()).data.sum()
+		inp_tensor = torch.LongTensor(self.src_spm.EncodeAsIds(src))#.unsqueeze(dim=0)
+		out_tensor = torch.LongTensor(self.trg_spm.EncodeAsIds(trg))#.unsqueeze(dim=0)
+		src_mask = (inp_tensor != self.src_spm.pad_id()).int()
+		trg_mask = (out_tensor != self.trg_spm.pad_id()).int()
+		ntokens = (out_tensor != self.trg_spm.pad_id()).data.sum()
 		
 		# to Variable
 		src_token = Variable(inp_tensor, requires_grad=False)
@@ -134,31 +138,86 @@ class TranslationDataset(Dataset):
 		
 		return [src_token, trg_token, src_mask, trg_mask, ntokens]
 
+def to_gpu(batch, device):
+	return list(map(lambda b: b.to(device), batch))
 
+def do_train(dataloader, model, loss_compute, device):
+	# change model to train mode
+	model.train()
 
-#def run_epoch(dataloader)
-def run_epoch(dataloader, model, loss_compute):
-	"Standard Training and Logging Function"
 	start = time.time()
 	total_tokens = 0
 	total_loss = 0
 	tokens = 0
-	for i, batch in enumerate(dataloader):
-		batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
-		#'''
-		out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
-		loss = loss_compute(out, batch_trg, batch_ntokens)
-		total_loss += loss
-		total_tokens += batch_ntokens
-		tokens += batch_ntokens
-		if i % 50 == 1:
-			elapsed = time.time() - start
-			print("Epoch Step: %d Loss: %f Tokens per Sec: %f" %
-					(i, loss / batch_ntokens, tokens / elapsed))
-			start = time.time()
-			tokens = 0
-		#'''
-	return total_loss / total_tokens
+
+	with tqdm(dataloader, desc='do training') as tbar:
+		for i, batch in enumerate(tbar):
+			# FIXME:
+			if i > 300:
+				break
+
+			# run model for training
+			if device == 'cpu':
+				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
+			else:
+				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = to_gpu(batch, device)
+			out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
+
+			# calculate loss
+			loss = loss_compute(out, batch_trg, batch_ntokens)
+			total_loss += loss
+			total_tokens += batch_ntokens
+			tokens += batch_ntokens
+
+			# print loss
+			if i % 50 == 1:
+				elapsed = time.time() - start
+				start = time.time()
+				tokens = 0
+		
+			# update tbar
+			tbar.set_postfix(loss=total_loss)
+
+def do_valid(dataloader, model, loss_compute, device):
+	# change model to validation mode
+	model.eval()
+
+	total_tokens = 0
+	total_loss = 0
+	tokens = 0
+	with tqdm(dataloader, desc='do validation') as tbar:
+		for i, batch in enumerate(tbar):
+			# FIXME:
+			if i > 200:
+				break
+
+			# run model for training
+			if device == 'cpu':
+				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
+			else:
+				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = to_gpu(batch, device)
+			out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
+
+			# calculate loss
+			loss = loss_compute(out, batch_trg, batch_ntokens)
+			total_loss += loss
+			total_tokens += batch_ntokens
+			tokens += batch_ntokens
+
+			# update tbar
+			tbar.set_postfix(loss=total_loss)
+
+		return total_loss / total_tokens
+
+def do_save(model, optimizer, epoch, loss):
+	torch.save({
+		'epoch': epoch + 1,					  # need only for retraining
+		'state_dict': model.module.state_dict(),
+		'best_val_loss': loss,		  # need only for retraining
+		'optimizer' : optimizer.state_dict(), # need only for retraining
+		'learning_rate' : optimizer._rate, # need only for retraining
+	}, './models/model-tmp.bin')
+	print('model was saved')
 
 global max_src_in_batch, max_tgt_in_batch
 def batch_size_fn(new, count, sofar):
@@ -206,13 +265,15 @@ class SimpleLossCompute:
 		
 	def __call__(self, x, y, norm):
 		x = self.generator(x)
+		a = self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1))
 		loss = self.criterion(x.contiguous().view(-1, x.size(-1)), 
 							  y.contiguous().view(-1)) / norm
-		loss.backward()
+
 		if self.opt is not None:
 			self.opt.step()
 			self.opt.optimizer.zero_grad()
-		return loss.data.item() * norm
+		loss.backward()
+		return loss.data.item() * norm.float()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--world_size', default=setting.world_size, type=int)
@@ -244,27 +305,51 @@ def main_worker(gpu, ngpus_per_node, args):
 	# load dataset
 	sent_pairs = load_dataset(path='/heavy_data/jkfirst/workspace/git/LaH/dataset/')
 	sent_pairs = list(map(lambda x: remove_bos_eos(x), sent_pairs))
-	dataset = TranslationDataset(sent_pairs)
-	dataloader = DataLoader(dataset, batch_size=5, collate_fn=set_padding)
 
+	# split train/valid sentence pairs
+	# FIXME: k-fold cross validation
+	n_train = int(len(sent_pairs) * 0.8)
+	train_sent_pairs = sent_pairs[:n_train]
+	valid_sent_pairs = sent_pairs[n_train:]
+
+	# make dataloader with dataset
+	src_spm, trg_spm = get_sentencepiece(src_prefix, trg_prefix, src_cmd=src_cmd, trg_cmd=trg_cmd)
+	train_dataset = TranslationDataset(train_sent_pairs, src_spm, trg_spm)
+	valid_dataset = TranslationDataset(valid_sent_pairs, src_spm, trg_spm)
+	train_dataloader = DataLoader(train_dataset, batch_size=16, collate_fn=set_padding)
+	valid_dataloader = DataLoader(valid_dataset, batch_size=100, collate_fn=set_padding)
 
 	# Train the simple copy task.
 	criterion = LabelSmoothing(size=args.n_words, padding_idx=0, smoothing=0.0)
 	model = make_model(args.n_words, args.n_words)
-	model_opt = NoamOpt(model.src_embed[0].d_model, 1, 400,
+	optimizer = NoamOpt(model.src_embed[0].d_model, 1, 400,
 			torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
 
-	model.cuda(args.gpu)
+	# make gpu-distributed model
+	device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() else 'cpu')
+	model.to(device)
+	model = DDP(model, device_ids=[args.gpu])
 
-	src_spm, trg_spm = get_sentencepiece(src_prefix, trg_prefix, src_cmd=src_cmd, trg_cmd=trg_cmd)
-	print(src_spm)
-	print(trg_spm)
-	exit()
+	best_val_loss = np.inf
 	for epoch in range(10):
-		model.train()
-		run_epoch(dataloader, model, 
-				  SimpleLossCompute(model.generator, criterion, model_opt))
-		break
+		do_train(train_dataloader,
+				model, 
+				SimpleLossCompute(model.module.generator, criterion, optimizer),
+				device)
+		valid_loss = do_valid(valid_dataloader,
+				model,
+				SimpleLossCompute(model.module.generator, criterion, optimizer),
+				device)
+		if valid_loss >= best_val_loss:
+			print('Try again')
+		else:
+			print('New record')
+			best_val_loss = valid_loss
+			do_save(model, optimizer, epoch, best_val_loss)
+		print('learning_rate: {:.4f}'.format(optimizer._rate))
+
+		print('{}th epoch: {:.4f}'.format(epoch, valid_loss))
+
 if __name__ == '__main__':
 	main()
 
