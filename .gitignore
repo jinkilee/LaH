@@ -7,6 +7,7 @@ korean-parallel-corpora/korean-english-news-v1/training_checkpoints
 **/*.model
 **/*.vocab
 **/*.txt
+**/*.out
 **/.ipynb_checkpoints/
 **/__pycache__
 **/*.bin
