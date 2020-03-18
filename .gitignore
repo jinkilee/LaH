@@ -9,3 +9,5 @@ korean-parallel-corpora/korean-english-news-v1/training_checkpoints
 **/*.txt
 **/.ipynb_checkpoints/
 **/__pycache__
+**/*.bin
+**/*.log
