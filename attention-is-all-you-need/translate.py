@@ -1,12 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# Reference
-# - https://nlp.seas.harvard.edu/2018/04/03/attention.html
-
-# In[1]:
-
-
 import sys
 sys.path.insert(0, '../')
 
@@ -21,6 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import logging
 import logging.config
+from torchtext.data.metrics import bleu_score
 from utils import fix_torch_randomness
 from modeling.transformer import *
 from dataset import load_dataset
@@ -156,7 +148,6 @@ def do_valid(dataloader, model, loss_compute, device, epoch):
 			else:
 				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = to_gpu(batch, device)
 			out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
-			log.debug('label/pred shape: {} -> {}'.format(batch_trg.shape, out.shape))
 
 			# calculate loss
 			loss = loss_compute(out, batch_trg, batch_ntokens, do_backward=False)
@@ -173,9 +164,9 @@ def do_translate(dataloader, model, translate, device, epoch):
 	# change model to validation mode
 	model.eval()
 
-	total_tokens = 0
-	total_loss = 0
-	tokens = 0
+	original_input = []
+	translated_ids = []
+	translated_lbl = []
 	with tqdm(dataloader, desc='validating {}th epoch'.format(epoch)) as tbar:
 		for i, batch in enumerate(tbar):
 			# run model for training
@@ -187,12 +178,12 @@ def do_translate(dataloader, model, translate, device, epoch):
 
 			# calculate loss
 			out = translate(out)
-			log.debug('do_translate: {} VS {}'.format(out.shape, batch_trg.shape))
-
-			# FIXME: add BLEU score
-			#tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
-
-		return out
+			original_input.extend(batch_src.to('cpu').numpy().tolist())
+			translated_ids.extend(out.to('cpu').numpy().tolist())
+			translated_lbl.extend(batch_trg.to('cpu').numpy().tolist())
+			#log.debug('out: {}'.format(translated_ids[-1]))
+			#log.debug('lbl: {}'.format(translated_lbl[-1]))
+	return original_input, translated_ids, translated_lbl
 
 class LabelSmoothing(nn.Module):
 	"Implement label smoothing."
@@ -216,7 +207,6 @@ class LabelSmoothing(nn.Module):
 			true_dist.index_fill_(0, mask.squeeze(), 0.0)
 		self.true_dist = true_dist
 		return self.criterion(x, Variable(true_dist, requires_grad=False))
-
 
 class SimpleLossCompute:
 	"A simple loss compute and train function."
@@ -249,31 +239,12 @@ class SimpleTranslation:
 		return x.argmax(dim=-1).int()
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--world_size', default=setting.world_size, type=int)
-parser.add_argument('--multi_gpu', default=setting.multi_gpu, type=bool)
 parser.add_argument('--n_words', default=setting.n_words, type=int)
+parser.add_argument('--gpu', default=setting.default_gpu, type=int)
 
 def main():
 	args = parser.parse_args()
-
-	if args.multi_gpu:
-		ngpus_per_node = torch.cuda.device_count()
-	else:
-		ngpus_per_node = 1
-
-	args.world_size = ngpus_per_node
-	mp.spawn(main_worker, nprocs=ngpus_per_node, 
-			 args=(ngpus_per_node, args, ))
-
-def main_worker(gpu, ngpus_per_node, args):
-	global best_acc1
-	args.gpu = gpu
-
 	torch.cuda.set_device(args.gpu)
-	dist.init_process_group(backend='nccl', 
-							init_method='env://',
-							world_size=args.world_size,
-							rank=args.gpu)
 
 	# load dataset
 	sent_pairs = load_dataset(path='/heavy_data/jkfirst/workspace/git/LaH/dataset/')
@@ -315,19 +286,52 @@ def main_worker(gpu, ngpus_per_node, args):
 	# make gpu-distributed model
 	device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() else 'cpu')
 	model.to(device)
-	model = DDP(model, device_ids=[args.gpu])
 
+	'''
 	valid_loss = do_valid(valid_dataloader,
 			model,
-			SimpleLossCompute(model.module.generator, criterion, optimizer),
-			device,
-			0)
-	do_translate(valid_dataloader,
-			model,
-			SimpleTranslation(model.module.generator),
+			SimpleLossCompute(model.generator, criterion, optimizer),
 			device,
 			0)
 	log.info('validation loss: {:.4f}'.format(valid_loss.data.item()))
+	'''
+
+	original_input, translated_pred, translated_lbl = do_translate(valid_dataloader,
+			model,
+			SimpleTranslation(model.generator),
+			device,
+			0)
+
+	original_input = list(map(src_spm.DecodeIds, original_input))
+	translated_pred = list(map(trg_spm.DecodeIds, translated_pred))
+	translated_label = list(map(trg_spm.DecodeIds, translated_lbl))
+
+	with open('output/model-tmp.out', 'w', encoding='utf-8') as out_f:
+		for src, pred, trg in zip(original_input, translated_pred, translated_label):
+			src = ''.join(src)
+			pred = ''.join(pred)
+			trg = ''.join(trg)
+			out_f.write('input: {}\n'.format(src))
+			out_f.write('pred : {}\n'.format(pred))
+			out_f.write('label: {}\n'.format(trg))
+			out_f.write('----------\n')
+
+	#translated_pred_text = list(map(lambda x: ''.join(x), translated_pred))
+	#translated_label_text = list(map(lambda x: ''.join(x), translated_label))
+	translated_pred = list(map(lambda x: trg_spm.EncodeAsPieces(x), translated_pred))
+	translated_label = list(map(lambda x: trg_spm.EncodeAsPieces(x), translated_label))
+
+	min_pred_len = min([len(p) for p in translated_pred])
+	min_label_len = min([len(p) for p in translated_label])
+	log.debug('{} {}'.format(min_pred_len, min_label_len))
+	log.debug('{}'.format(translated_pred[:4]))
+	log.debug('{}'.format(translated_label[:4]))
+
+	bleu = bleu_score(translated_pred, translated_label)
+	log.info('bleu score: {:.4f}'.format(bleu))
+
+	bleu = bleu_score(translated_pred, translated_pred)
+	log.info('bleu score: {:.4f}'.format(bleu))
 
 if __name__ == '__main__':
 	main()
