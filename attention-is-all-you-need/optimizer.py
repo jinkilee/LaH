@@ -1,6 +1,7 @@
 import torch
+from torch.optim import Optimizer
 
-class NoamOpt:
+class NoamOpt(Optimizer):
 	"Optim wrapper that implements rate."
 	def __init__(self, model_size, factor, warmup, optimizer):
 		self.optimizer = optimizer

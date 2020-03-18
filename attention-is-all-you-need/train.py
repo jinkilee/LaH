@@ -19,7 +19,9 @@ import sentencepiece as spm
 import argparse
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
+import logging
+import logging.config
+from utils import fix_torch_randomness
 from modeling.transformer import *
 from dataset import load_dataset
 from torch.utils.data import DataLoader, TensorDataset, Dataset
@@ -29,6 +31,14 @@ from conf import *
 from feature import *
 from optimizer import NoamOpt
 
+# define logger 
+logging.config.fileConfig('logging.conf')
+log = logging.getLogger('LaH')
+
+fileHandler = logging.FileHandler('train.log')
+log.addHandler(fileHandler)
+
+# define ENV variables
 os.environ['MASTER_ADDR'] = '127.0.0.1'
 os.environ['MASTER_PORT'] = '10002'
 
@@ -108,7 +118,6 @@ def set_padding(dataset_list):
 	src_mask_tensor = pad_sequence(src_mask_list, batch_first=True).unsqueeze(dim=-2)
 	trg_mask_tensor = pad_sequence(trg_mask_list, batch_first=True).unsqueeze(dim=-2)
 
-	src_token_tensor.to()	
 	return [src_token_tensor, trg_token_tensor, src_mask_tensor, trg_mask_tensor, ntokens]
 
 class TranslationDataset(Dataset):
@@ -141,7 +150,7 @@ class TranslationDataset(Dataset):
 def to_gpu(batch, device):
 	return list(map(lambda b: b.to(device), batch))
 
-def do_train(dataloader, model, loss_compute, device):
+def do_train(dataloader, model, loss_compute, device, epoch):
 	# change model to train mode
 	model.train()
 
@@ -150,12 +159,8 @@ def do_train(dataloader, model, loss_compute, device):
 	total_loss = 0
 	tokens = 0
 
-	with tqdm(dataloader, desc='do training') as tbar:
+	with tqdm(dataloader, desc='training {}th epoch'.format(epoch)) as tbar:
 		for i, batch in enumerate(tbar):
-			# FIXME:
-			if i > 300:
-				break
-
 			# run model for training
 			if device == 'cpu':
 				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
@@ -176,21 +181,17 @@ def do_train(dataloader, model, loss_compute, device):
 				tokens = 0
 		
 			# update tbar
-			tbar.set_postfix(loss=total_loss)
+			tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
 
-def do_valid(dataloader, model, loss_compute, device):
+def do_valid(dataloader, model, loss_compute, device, epoch):
 	# change model to validation mode
 	model.eval()
 
 	total_tokens = 0
 	total_loss = 0
 	tokens = 0
-	with tqdm(dataloader, desc='do validation') as tbar:
+	with tqdm(dataloader, desc='validating {}th epoch'.format(epoch)) as tbar:
 		for i, batch in enumerate(tbar):
-			# FIXME:
-			if i > 200:
-				break
-
 			# run model for training
 			if device == 'cpu':
 				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
@@ -199,38 +200,30 @@ def do_valid(dataloader, model, loss_compute, device):
 			out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
 
 			# calculate loss
-			loss = loss_compute(out, batch_trg, batch_ntokens)
+			loss = loss_compute(out, batch_trg, batch_ntokens, do_backward=False)
 			total_loss += loss
 			total_tokens += batch_ntokens
 			tokens += batch_ntokens
 
 			# update tbar
-			tbar.set_postfix(loss=total_loss)
+			tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
 
 		return total_loss / total_tokens
 
 def do_save(model, optimizer, epoch, loss):
+	model_full_path = './models/model-tmp.bin'
+
+	# FIXME: fix model name
 	torch.save({
 		'epoch': epoch + 1,					  # need only for retraining
 		'state_dict': model.module.state_dict(),
 		'best_val_loss': loss,		  # need only for retraining
-		'optimizer' : optimizer.state_dict(), # need only for retraining
+		'optimizer' : optimizer.optimizer.state_dict(), # need only for retraining
 		'learning_rate' : optimizer._rate, # need only for retraining
-	}, './models/model-tmp.bin')
-	print('model was saved')
+	}, model_full_path)
 
-global max_src_in_batch, max_tgt_in_batch
-def batch_size_fn(new, count, sofar):
-	"Keep augmenting batch and calculate total number of tokens + padding."
-	global max_src_in_batch, max_tgt_in_batch
-	if count == 1:
-		max_src_in_batch = 0
-		max_tgt_in_batch = 0
-	max_src_in_batch = max(max_src_in_batch,  len(new.src))
-	max_tgt_in_batch = max(max_tgt_in_batch,  len(new.trg) + 2)
-	src_elements = count * max_src_in_batch
-	tgt_elements = count * max_tgt_in_batch
-	return max(src_elements, tgt_elements)
+	sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
+	log.info('model was saved at {} -> {:.4f}'.format(model_full_path, sum_of_weight))
 
 class LabelSmoothing(nn.Module):
 	"Implement label smoothing."
@@ -263,11 +256,13 @@ class SimpleLossCompute:
 		self.criterion = criterion
 		self.opt = opt
 		
-	def __call__(self, x, y, norm):
+	def __call__(self, x, y, norm, do_backward=True):
 		x = self.generator(x)
 		a = self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1))
 		loss = self.criterion(x.contiguous().view(-1, x.size(-1)), 
 							  y.contiguous().view(-1)) / norm
+		if not do_backward:
+			return loss.data.item() * norm.float()
 
 		if self.opt is not None:
 			self.opt.step()
@@ -307,17 +302,23 @@ def main_worker(gpu, ngpus_per_node, args):
 	sent_pairs = list(map(lambda x: remove_bos_eos(x), sent_pairs))
 
 	# split train/valid sentence pairs
-	# FIXME: k-fold cross validation
 	n_train = int(len(sent_pairs) * 0.8)
+	np.random.seed(args.gpu)
 	train_sent_pairs = sent_pairs[:n_train]
+	np.random.shuffle(train_sent_pairs)
+	train_sent_pairs = train_sent_pairs[:int(n_train*(1.-1./args.world_size))]
 	valid_sent_pairs = sent_pairs[n_train:]
 
 	# make dataloader with dataset
+	# FIXME: RuntimeError: Internal: unk is not defined.
 	src_spm, trg_spm = get_sentencepiece(src_prefix, trg_prefix, src_cmd=src_cmd, trg_cmd=trg_cmd)
 	train_dataset = TranslationDataset(train_sent_pairs, src_spm, trg_spm)
 	valid_dataset = TranslationDataset(valid_sent_pairs, src_spm, trg_spm)
-	train_dataloader = DataLoader(train_dataset, batch_size=16, collate_fn=set_padding)
+	train_dataloader = DataLoader(train_dataset, batch_size=128, collate_fn=set_padding)
 	valid_dataloader = DataLoader(valid_dataset, batch_size=100, collate_fn=set_padding)
+
+	# fix torch randomness
+	fix_torch_randomness()
 
 	# Train the simple copy task.
 	criterion = LabelSmoothing(size=args.n_words, padding_idx=0, smoothing=0.0)
@@ -332,23 +333,25 @@ def main_worker(gpu, ngpus_per_node, args):
 
 	best_val_loss = np.inf
 	for epoch in range(10):
+		# FIXME: add sampler
 		do_train(train_dataloader,
 				model, 
 				SimpleLossCompute(model.module.generator, criterion, optimizer),
-				device)
+				device,
+				epoch)
 		valid_loss = do_valid(valid_dataloader,
 				model,
 				SimpleLossCompute(model.module.generator, criterion, optimizer),
-				device)
-		if valid_loss >= best_val_loss:
-			print('Try again')
-		else:
-			print('New record')
-			best_val_loss = valid_loss
-			do_save(model, optimizer, epoch, best_val_loss)
-		print('learning_rate: {:.4f}'.format(optimizer._rate))
+				device,
+				epoch)
 
-		print('{}th epoch: {:.4f}'.format(epoch, valid_loss))
+		if valid_loss >= best_val_loss:
+			log.info('Try again. Current best is still {:.4f}'.format(best_val_loss))
+		else:
+			log.info('New record. from {:.4f} to {:.4f}'.format(best_val_loss, valid_loss))
+			best_val_loss = valid_loss
+			if args.gpu == 0:
+				do_save(model, optimizer, epoch, best_val_loss)
 
 if __name__ == '__main__':
 	main()
