@@ -12,3 +12,4 @@ plotly
 tensorflow_gpu
 gluonnlp >= 0.8.3
 pandas
+torchnlp
