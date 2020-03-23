@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, '../')
+sys.path.insert(0, '../modeling')
 
 import os
 from tqdm import tqdm, trange
@@ -14,12 +14,12 @@ import logging
 import logging.config
 from torchtext.data.metrics import bleu_score
 from utils import fix_torch_randomness
-from modeling.transformer import *
+from transformer import *
 from dataset import load_dataset
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn.parallel import DistributedDataParallel as DDP
-from conf import *
+from setting import *
 from feature import *
 from optimizer import NoamOpt
 
@@ -61,7 +61,7 @@ src_cmd = templates.format(src_input_file,
 				eos_id,
 				unk_id,
 				src_prefix,
-				vocab_size,
+				src_vocab_size,
 				character_coverage,
 				model_type)
 
@@ -71,7 +71,7 @@ trg_cmd = templates.format(trg_input_file,
 				eos_id,
 				unk_id,
 				trg_prefix,
-				vocab_size,
+				trg_vocab_size,
 				character_coverage,
 				model_type)
 
@@ -82,7 +82,7 @@ def get_sentencepiece(src_prefix, trg_prefix, src_cmd=None, trg_cmd=None):
 	trg_spm.Load('{}.model'.format(trg_prefix)) 
 
 	extra_options = 'bos:eos' #'reverse:bos:eos'
-	src_spm.SetEncodeExtraOptions(extra_options)
+	#src_spm.SetEncodeExtraOptions(extra_options)
 	trg_spm.SetEncodeExtraOptions(extra_options)
 
 	return src_spm, trg_spm
@@ -132,33 +132,6 @@ class TranslationDataset(Dataset):
 
 def to_gpu(batch, device):
 	return list(map(lambda b: b.to(device), batch))
-
-def do_valid(dataloader, model, loss_compute, device, epoch):
-	# change model to validation mode
-	model.eval()
-
-	total_tokens = 0
-	total_loss = 0
-	tokens = 0
-	with tqdm(dataloader, desc='validating {}th epoch'.format(epoch)) as tbar:
-		for i, batch in enumerate(tbar):
-			# run model for training
-			if device == 'cpu':
-				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
-			else:
-				batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = to_gpu(batch, device)
-			out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
-
-			# calculate loss
-			loss = loss_compute(out, batch_trg, batch_ntokens, do_backward=False)
-			total_loss += loss
-			total_tokens += batch_ntokens
-			tokens += batch_ntokens
-
-			# update tbar
-			tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
-
-		return total_loss / total_tokens
 
 def do_translate(dataloader, model, translate, device, epoch):
 	# change model to validation mode
@@ -248,7 +221,7 @@ def main():
 
 	# load dataset
 	sent_pairs = load_dataset(path='/heavy_data/jkfirst/workspace/git/LaH/dataset/')
-	sent_pairs = list(map(lambda x: remove_bos_eos(x), sent_pairs))
+	#sent_pairs = list(map(lambda x: remove_bos_eos(x), sent_pairs))
 
 	# split train/valid sentence pairs
 	n_train = int(len(sent_pairs) * 0.8)
@@ -264,8 +237,11 @@ def main():
 	fix_torch_randomness()
 
 	# Train the simple copy task.
-	criterion = LabelSmoothing(size=args.n_words, padding_idx=0, smoothing=0.0)
-	model = make_model(args.n_words, args.n_words)
+	args.inp_n_words = src_vocab_size
+	args.out_n_words = trg_vocab_size
+	model = make_model(args.inp_n_words, args.out_n_words)
+
+	criterion = LabelSmoothing(size=args.out_n_words, padding_idx=0, smoothing=0.0)
 	optimizer = NoamOpt(
 			model.src_embed[0].d_model, 
 			1, 
@@ -286,15 +262,6 @@ def main():
 	# make gpu-distributed model
 	device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() else 'cpu')
 	model.to(device)
-
-	'''
-	valid_loss = do_valid(valid_dataloader,
-			model,
-			SimpleLossCompute(model.generator, criterion, optimizer),
-			device,
-			0)
-	log.info('validation loss: {:.4f}'.format(valid_loss.data.item()))
-	'''
 
 	original_input, translated_pred, translated_lbl = do_translate(valid_dataloader,
 			model,
