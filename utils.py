@@ -35,7 +35,3 @@ def set_seeds(seed):
     else:
         print("Running in non-deterministic mode")
 
-def fix_torch_randomness(seed=0):
-	torch.manual_seed(seed)
-	if torch.cuda.is_available():
-		torch.cuda.manual_seed_all(seed)
