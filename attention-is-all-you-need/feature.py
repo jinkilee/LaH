@@ -1,5 +1,6 @@
 import re
 
+'''
 def remove_bos_eos(pair):
 	src, trg = pair
 	src = re.sub('<start> ', '', src)
@@ -7,6 +8,7 @@ def remove_bos_eos(pair):
 	trg = re.sub('<start> ', '', trg)
 	trg = re.sub(' <end>', '', trg)
 	return [src, trg]
+'''
 
 def write_to_one_text(sent_pairs):
 	with open('./spm_src.txt', 'w', encoding='utf8') as src_f:
