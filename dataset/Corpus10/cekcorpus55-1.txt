@@ -774,7 +774,6 @@
 #The baby will be either a boy or a girl.
 #이 아기는 남자가 아니면 여자 아이다.
 
-
 [195]
 #When's the baby due?.
 #이 아기의 출산일이 언제입니까?

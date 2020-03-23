@@ -884,16 +884,7 @@
 
 [222]
 #As building contractors we erect about a hundred houses and two or three blocks of flats a year.
-#As building contractors we erect about a hundred houses and two or three blocks of flats a year.
 #건축 청부상으로서, 우리는 매년 거의 100채의 집과 2,3동의 아파트 건물을 짓는다.
-
-[223]
-#A typing pool is a group of typists,in one large office,who do all the typing for a company.
-# "A typing pool"은 회사내의 하나의 큰 사무실에서 집중적으로 모든 타자업무를 맡아하는 한 무리의 타자원들이다.
-
-[224]
-#"His fawning manner whenever the boss is around just makes me curl up.I tell you --it curls me up,"said John.
-# "사장이 오기만 하면, 그의 그 알랑거리는 모양이 정말 나를 화나게 한다. 너에게 말하는데, 그 꼴이 정말 나를 화나게 한다."고 John이 말했다.
 
 [225]
 #Building constructors in ......and Asia have found our products easy to install and very attractive in appearance.

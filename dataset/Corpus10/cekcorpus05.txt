@@ -3421,7 +3421,6 @@
 [856]
 #They hit one another.
 #그들은 서로 때리기 시작했다.
-#They hit one another.
 
 [857]
 #They met each other.

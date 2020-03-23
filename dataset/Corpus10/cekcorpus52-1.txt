@@ -514,7 +514,6 @@
 #Young children like games in which they dress up.
 #아이들은 화장놀이를 좋아한다.
 
-
 [130]
 #The children scrawled all over the wall.
 #아이들은 온 벽에 어지럽게 낙서를 했다.
@@ -1290,3 +1289,4 @@
 [323]
 #Many people hold to the theory that smoking is a cause of cancer.
 #많은 사람들이 담배가 암을 유발한다는 견해를 지지한다.
+
