@@ -4,13 +4,11 @@
 # Reference
 # - https://nlp.seas.harvard.edu/2018/04/03/attention.html
 
-# In[1]:
-
-
 import sys
 sys.path.insert(0, '../modeling')
 
 import os
+import dill
 import time
 from tqdm import tqdm, trange
 import glob
@@ -22,13 +20,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import logging
 import logging.config
+import random
 
 from torchtext import data, datasets
-from loss_compute import SimpleLossCompute, MultiGPULossCompute
+from loss_compute import SimpleLossCompute, MultiGPULossCompute, MultiGPULossCompute_
 from utils import fix_torch_randomness, to_gpu, get_sentencepiece
 from transformer import *
-from dataset import load_dataset, set_padding, KRENDataset, Batch
-from torch.utils.data import DataLoader
+from dataset import load_dataset_aihub, set_padding, KRENDataset, KRENField, Batch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from setting import *
@@ -44,10 +42,13 @@ fileHandler = logging.FileHandler('train.log')
 log.addHandler(fileHandler)
 
 # define ENV variables
-os.environ['MASTER_ADDR'] = '127.0.0.1'
-os.environ['MASTER_PORT'] = '10002'
+#os.environ['MASTER_ADDR'] = '127.0.0.1'
+#os.environ['MASTER_PORT'] = '10002'
 
-inp_lang, out_lang = get_sentencepiece(src_prefix, trg_prefix)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--devices', default='0', type=str)
+parser.add_argument('--epochs', default=45, type=int)
 
 def batch_size_fn(new, count, sofar):
     "Keep augmenting batch and calculate total number of tokens + padding."
@@ -88,27 +89,6 @@ def make_model(src_vocab, tgt_vocab, N=6,
 			nn.init.xavier_uniform_(p)
 	return model
 
-make_sentencepiece = True
-src_cmd = templates.format(src_input_file,
-				pad_id,
-				bos_id,
-				eos_id,
-				unk_id,
-				src_prefix,
-				src_vocab_size,
-				character_coverage,
-				model_type)
-
-trg_cmd = templates.format(trg_input_file,
-				pad_id,
-				bos_id,
-				eos_id,
-				unk_id,
-				trg_prefix,
-				trg_vocab_size,
-				character_coverage,
-				model_type)
-
 def do_train(dataloader, model, loss_compute, epoch):
 	# change model to train mode
 	model.train()
@@ -124,7 +104,6 @@ def do_train(dataloader, model, loss_compute, epoch):
 			out = model.forward(batch.src, batch.trg, batch.src_mask, batch.trg_mask)
 
 			# calculate loss
-			log.debug('{} {}'.format(out.shape, batch.trg_y.shape))
 			loss = loss_compute(out, batch.trg_y, batch.ntokens)
 			total_loss += loss
 			total_tokens += batch.ntokens
@@ -141,14 +120,14 @@ def do_valid(dataloader, model, loss_compute, epoch):
 	tokens = 0
 	with tqdm(dataloader, desc='validating {}th epoch'.format(epoch)) as tbar:
 		for i, batch in enumerate(tbar):
-			batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
-			out = model.forward(batch_src, batch_trg, batch_src_mask, batch_trg_mask)
+			#batch_src, batch_trg, batch_src_mask, batch_trg_mask, batch_ntokens = batch
+			out = model.forward(batch.src, batch.trg, batch.src_mask, batch.trg_mask)
 
 			# calculate loss
-			loss = loss_compute(out, batch_trg, batch_ntokens)
+			loss = loss_compute(out, batch.trg_y, batch.ntokens)
 			total_loss += loss
-			total_tokens += batch_ntokens
-			tokens += batch_ntokens
+			total_tokens += batch.ntokens
+			tokens += batch.ntokens
 
 			# update tbar
 			tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
@@ -194,8 +173,6 @@ class LabelSmoothing(nn.Module):
 		return self.criterion(x, Variable(true_dist, requires_grad=False))
 
 
-parser = argparse.ArgumentParser()
-
 class MyIterator(data.Iterator):
 	def create_batches(self):
 		if self.train:
@@ -213,39 +190,40 @@ class MyIterator(data.Iterator):
 			for b in data.batch(self.data(), self.batch_size, self.batch_size_fn):
 				self.batches.append(sorted(b, key=self.sort_key))
 
-def tokenize_kr(text):
-	return inp_lang.EncodeAsPieces(text)
-
-def tokenize_en(text):
-	return out_lang.EncodeAsPieces(text)
-
 def main():
 	args = parser.parse_args()
-
-	args.gpu = 0
-	#devices = range(torch.cuda.device_count())
-	devices = [0, 1]
+	if args.devices is not 'cpu':
+		devices = list(map(int, args.devices.split(',')))
 
 	# load dataset
-	sent_pairs = load_dataset(path='/heavy_data/jkfirst/workspace/git/LaH/dataset/')
+	sent_pairs = load_dataset_aihub()
+	inp_lang, out_lang = get_sentencepiece(src_prefix, trg_prefix)
+
+	# shuffle sent_pairs
+	random.shuffle(sent_pairs)
 
 	# split train/valid sentence pairs
 	n_train = int(len(sent_pairs) * 0.8)
 	train_sent_pairs = sent_pairs[:n_train]
 	valid_sent_pairs = sent_pairs[n_train:]
-	log.debug('{} {}'.format(len(train_sent_pairs), len(valid_sent_pairs)))
 	train_sent_pairs = sorted(train_sent_pairs, key=lambda x: (len(x[0]), len(x[1])))
 
-	SRC = data.Field(tokenize=tokenize_kr, pad_token='<pad>')
-	TRG = data.Field(tokenize=tokenize_en, init_token='<bos>', eos_token='<eos>', pad_token='<pad>')
+	# these are used for defining tokenize method and some reserved words
+	SRC = KRENField(
+		tokenize=inp_lang.EncodeAsPieces, 
+		pad_token='<pad>')
+	TRG = KRENField(
+		tokenize=out_lang.EncodeAsPieces, 
+		init_token='<bos>', 
+		eos_token='<eos>', 
+		pad_token='<pad>')
 
-	# make dataloader with dataset
+	# make dataloader from KRENDataset
 	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang)
+	SRC.build_vocab(train.src)
+	TRG.build_vocab(train.trg)
 
-	SRC.build_vocab(train.src, min_freq=MIN_FREQ)
-	TRG.build_vocab(train.trg, min_freq=MIN_FREQ)
-
-	train_iter = MyIterator(train, batch_size=128, device=0,
+	train_iter = MyIterator(train, batch_size=512, device=0,
                             repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
                             batch_size_fn=batch_size_fn, train=True)
 	valid_iter = MyIterator(valid, batch_size=100, device=0,
@@ -255,45 +233,56 @@ def main():
 	# fix torch randomness
 	fix_torch_randomness()
 
-	# Train the simple copy task.
+	# define input/output size
 	args.inp_n_words = src_vocab_size
 	args.out_n_words = trg_vocab_size
 	log.info('inp_n_words: {} out_n_words: {}'.format(args.inp_n_words, args.out_n_words))
+
+	# define model
 	model = make_model(args.inp_n_words, args.out_n_words)
-	model.cuda()
+	if args.devices is not 'cpu':
+		model.cuda()
 
+	# define model
 	criterion = LabelSmoothing(size=args.out_n_words, padding_idx=0, smoothing=0.0)
-	criterion.cuda()
+	if args.devices is not 'cpu':
+		criterion.cuda()
 
+	# define optimizer
 	optimizer = NoamOpt(
-			model.src_embed[0].d_model, 
-			1, 
-			400,
-			torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+			model_size=model.src_embed[0].d_model, 
+			factor=1, 
+			warmup=400,
+			optimizer=torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
 
 	# make parallel model
-	model_par = nn.DataParallel(model, device_ids=[0,1,2,3])
-	#model_par = nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
+	if args.devices is not 'cpu' and len(devices) > 1:
+		model_par = nn.DataParallel(model, device_ids=devices)
 
+	# initial best loss
 	best_val_loss = np.inf
-	for epoch in range(45):
+
+	# start training
+	for epoch in range(args.epochs):
+		#'''
 		# FIXME: add sampler
 		do_train((rebatch(pad_id, b) for b in train_iter),
-				model_par, 
-				MultiGPULossCompute(model.generator, criterion, devices=devices, opt=optimizer),
+				model_par if args.devices is not 'cpu' and len(devices) > 1 else model,
+				MultiGPULossCompute_(model.generator, criterion, devices=devices, opt=optimizer),
 				epoch)
-		valid_loss = do_valid(valid_dataloader,
-				model_par,
-				MultiGPULossCompute(model.generator, criterion, devices=devices, opt=None),
+		#'''
+		valid_loss = do_valid((rebatch(pad_id, b) for b in valid_iter),
+				model_par if args.devices is not 'cpu' and len(devices) > 1 else model,
+				MultiGPULossCompute_(model.generator, criterion, devices=devices, opt=None),
 				epoch)
 
 		if valid_loss >= best_val_loss:
-			log.info('Try again. valid_loss is not smaller than current best: {:.6f} > {:.6f}'.format(valid_loss, best_val_loss))
+			log.info('Try again. valid_loss is not smaller \
+				than current best: {:.6f} > {:.6f}'.format(valid_loss, best_val_loss))
 		else:
 			log.info('New record. from {:.6f} to {:.6f}'.format(best_val_loss, valid_loss))
 			best_val_loss = valid_loss
-			if args.gpu == 0:
-				do_save(model, optimizer, epoch, best_val_loss)
+			do_save(model, optimizer, epoch, best_val_loss)
 
 if __name__ == '__main__':
 	main()

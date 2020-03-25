@@ -15,13 +15,13 @@ def get_sentencepiece(src_prefix, trg_prefix, src_cmd=None, trg_cmd=None, make_s
 		trg_spm = spm.SentencePieceTrainer.Train(trg_cmd)
 		src_spm = spm.SentencePieceProcessor()
 		trg_spm = spm.SentencePieceProcessor()
-		src_spm.Load('{}.model'.format(src_prefix)) 
-		trg_spm.Load('{}.model'.format(trg_prefix))
+		src_spm.Load('spm/{}.model'.format(src_prefix)) 
+		trg_spm.Load('spm/{}.model'.format(trg_prefix))
 	else: 
 		src_spm = spm.SentencePieceProcessor()
 		trg_spm = spm.SentencePieceProcessor()
-		src_spm.Load('{}.model'.format(src_prefix)) 
-		trg_spm.Load('{}.model'.format(trg_prefix)) 
+		src_spm.Load('spm/{}.model'.format(src_prefix)) 
+		trg_spm.Load('spm/{}.model'.format(trg_prefix)) 
 
 	extra_options = 'bos:eos' #'reverse:bos:eos'
 	#src_spm.SetEncodeExtraOptions(extra_options)

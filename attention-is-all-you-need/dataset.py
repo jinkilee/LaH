@@ -14,6 +14,8 @@ from feature import *
 from torch.nn.utils.rnn import pad_sequence
 from torchtext.datasets.translation import TranslationDataset
 from torchtext import data
+from torchtext.vocab import Vocab
+from collections import Counter
 
 # perform basic cleaning
 exclude = set(string.punctuation) # Set of all special characters
@@ -28,20 +30,20 @@ def subsequent_mask(size):
 	return torch.from_numpy(subsequent_mask) == 0
 
 class Batch:
-    def __init__(self, src, trg=None, pad=0):
-        self.src = src
-        self.src_mask = (src != pad).unsqueeze(-2)
-        if trg is not None:
-            self.trg = trg[:, :-1]
-            self.trg_y = trg[:, 1:]
-            self.trg_mask = self.make_std_mask(self.trg, pad)
-            self.ntokens = (self.trg_y != pad).data.sum()
+	def __init__(self, src, trg=None, pad=0):
+		self.src = src
+		self.src_mask = (src != pad).unsqueeze(-2)
+		if trg is not None:
+			self.trg = trg[:, :-1]
+			self.trg_y = trg[:, 1:]
+			self.trg_mask = self.make_std_mask(self.trg, pad)
+			self.ntokens = (self.trg_y != pad).data.sum()
 
-    @staticmethod
-    def make_std_mask(tgt, pad):
-        tgt_mask = (tgt != pad).unsqueeze(-2)
-        tgt_mask = tgt_mask & Variable(subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
-        return tgt_mask
+	@staticmethod
+	def make_std_mask(tgt, pad):
+		tgt_mask = (tgt != pad).unsqueeze(-2)
+		tgt_mask = tgt_mask & Variable(subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
+		return tgt_mask
 
 class KRENDataset(TranslationDataset):
 	"""The IWSLT 2016 TED talk translation task"""
@@ -59,8 +61,8 @@ class KRENDataset(TranslationDataset):
 			fields = [('src', fields[0]), ('trg', fields[1])]
 
 		sent_pairs = list(filter(lambda x: len(x[0])*len(x[1]) != 0, sent_pairs))
-		sent_pairs = list(filter(lambda x: len(x[0]) > MIN and len(x[1]) > MIN, sent_pairs))
-		sent_pairs = list(filter(lambda x: len(x[0]) < MAX and len(x[1]) < MAX, sent_pairs))
+		sent_pairs = list(filter(lambda x: len(x[0]) > MIN and len(x[0]) > MIN, sent_pairs))
+		sent_pairs = list(filter(lambda x: len(x[1]) > MIN and len(x[1]) > MAX, sent_pairs))
 
 		examples = []
 		#examples.append(data.Example.fromlist([src_line, trg_line], fields))
@@ -72,7 +74,7 @@ class KRENDataset(TranslationDataset):
 		super(TranslationDataset, self).__init__(examples, fields)
 
 	@classmethod
-	def splits(cls, sent_pairs, fields, inp_lang, out_lang, **kwargs):
+	def splits(cls, sent_pairs, fields, inp_lang, out_lang, split_ratio=[0.8,0.1,0.1], **kwargs):
 		"""Create dataset objects for splits of the IWSLT dataset.
 
 		Arguments:
@@ -86,16 +88,19 @@ class KRENDataset(TranslationDataset):
 			Remaining keyword arguments: Passed to the splits method of
 				Dataset.
 		"""
+		assert sum(split_ratio) == 1, 'split_ratio should sum up to 1.0'
 
-		n_train = int(len(sent_pairs) * 0.8)
-		n_valid = int(len(sent_pairs) * 0.15)
-		train_sent_pairs = sent_pairs[:n_train]
-		valid_sent_pairs = sent_pairs[n_train:n_train+n_valid]
-		test_sent_pairs = sent_pairs[n_train+n_valid:]
+		split_ratio = np.cumsum(split_ratio)
+		split_ratio = list(map(lambda x: int(len(sent_pairs)*x), split_ratio))
+		n_train, n_valid, n_test = split_ratio
+		train_sent_pairs = sent_pairs[0:n_train]
+		valid_sent_pairs = sent_pairs[n_train:n_valid]
+		test_sent_pairs = sent_pairs[n_valid:]
 
 		train_data = cls(train_sent_pairs, fields, inp_lang, out_lang, **kwargs)
 		val_data = cls(valid_sent_pairs, fields, inp_lang, out_lang, **kwargs)
 		test_data = cls(test_sent_pairs, fields, inp_lang, out_lang, **kwargs)
+
 		return tuple(d for d in (train_data, val_data, test_data)
 					 if d is not None)
 
@@ -166,6 +171,22 @@ def preprocess_eng_sentence(sent, add_bos_eos=False):
 	if add_bos_eos:
 		sent = '<bos> ' + sent + ' <eos>'
 	return sent
+
+def load_dataset_aihub(path='../attention-is-all-you-need/data/'):
+	sent_pairs = []
+	for f in os.listdir(path):
+		one_df = pd.read_excel(os.path.join('../attention-is-all-you-need/data', f))
+		one_df = one_df.rename(columns={
+			'영어':'eng',
+			'한국어':'kor',
+			'원문':'kor',
+			'영어 검수':'label',
+			'영어검수':'label',
+			'Review':'label',
+			'REVIEW':'label',
+		})
+		sent_pairs.extend(one_df[['kor','label']].values.tolist())
+	return sent_pairs
 
 def load_dataset_kaist(path):
 	files = glob.glob(os.path.join(path, 'Corpus10', 'cekcorpus*.txt'))
@@ -259,3 +280,18 @@ def subsequent_mask(size):
 	subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
 	return torch.from_numpy(subsequent_mask) == 0
 
+class KRENField(data.Field):
+	def build_vocab(self, dataset, **kwargs):
+		'''
+			This function has to make `self.vocab` which has the following properties.
+			- freqs
+			- itos
+			- unk_index
+			- stoi
+			- vectors
+		'''
+		counter = Counter()
+
+		for d in dataset:
+			counter.update(d)
+		self.vocab = Vocab(counter)
