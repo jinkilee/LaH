@@ -198,6 +198,8 @@ def main():
 	# load dataset
 	sent_pairs = load_dataset_aihub()
 	inp_lang, out_lang = get_sentencepiece(src_prefix, trg_prefix)
+	log.info('loaded input sentencepiece model: {}'.format(src_prefix))
+	log.info('loaded output sentencepiece model: {}'.format(trg_prefix))
 
 	# shuffle sent_pairs
 	random.shuffle(sent_pairs)

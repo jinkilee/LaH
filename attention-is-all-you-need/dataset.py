@@ -172,16 +172,17 @@ def preprocess_eng_sentence(sent, add_bos_eos=False):
 		sent = '<bos> ' + sent + ' <eos>'
 	return sent
 
-def load_dataset_aihub(path='../attention-is-all-you-need/data/'):
+def load_dataset_aihub(path='../dataset/aihub'):
 	sent_pairs = []
 	for f in os.listdir(path):
-		one_df = pd.read_excel(os.path.join('../attention-is-all-you-need/data', f))
+		one_df = pd.read_excel(os.path.join(path, f))
 		one_df = one_df.rename(columns={
 			'영어':'eng',
 			'한국어':'kor',
 			'원문':'kor',
 			'영어 검수':'label',
 			'영어검수':'label',
+			'번역문':'label',
 			'Review':'label',
 			'REVIEW':'label',
 		})
