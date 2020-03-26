@@ -197,11 +197,13 @@ def main():
 
 	# load dataset
 	sent_pairs = load_dataset_aihub()
+	#sent_pairs = load_dataset_aihub(path='/heavy_data/jkfirst/workspace/git/LaH/attention-is-all-you-need/data')
 	inp_lang, out_lang = get_sentencepiece(src_prefix, trg_prefix)
 	log.info('loaded input sentencepiece model: {}'.format(src_prefix))
 	log.info('loaded output sentencepiece model: {}'.format(trg_prefix))
 
 	# shuffle sent_pairs
+	random.seed(100)
 	random.shuffle(sent_pairs)
 
 	# split train/valid sentence pairs
@@ -216,14 +218,20 @@ def main():
 		pad_token='<pad>')
 	TRG = KRENField(
 		tokenize=out_lang.EncodeAsPieces, 
-		init_token='<bos>', 
-		eos_token='<eos>', 
+		init_token='<s>', 
+		eos_token='</s>', 
 		pad_token='<pad>')
 
 	# make dataloader from KRENDataset
 	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang)
 	SRC.build_vocab(train.src)
 	TRG.build_vocab(train.trg)
+	log.debug(SRC.vocab)
+
+	torch.save(SRC.vocab, 'spm/{}.spm'.format(src_prefix), pickle_module=dill)
+	torch.save(TRG.vocab, 'spm/{}.spm'.format(trg_prefix), pickle_module=dill)
+	log.info('input vocab was saved: spm/{}.spm'.format(src_prefix))
+	log.info('output vocab was saved: spm/{}.spm'.format(trg_prefix))
 
 	train_iter = MyIterator(train, batch_size=512, device=0,
                             repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
