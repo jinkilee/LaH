@@ -20,6 +20,7 @@ from loss_compute import SimpleLossCompute, MultiGPULossCompute, MultiGPULossCom
 from utils import fix_torch_randomness, get_sentencepiece 
 from transformer import *
 from dataset import load_dataset_aihub, KRENDataset, KRENField, MyIterator, batch_size_fn, rebatch
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils.rnn import pad_sequence
@@ -27,12 +28,18 @@ from setting import *
 from feature import *
 from optimizer import NoamOpt
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+
 # define logger 
 logging.config.fileConfig('logging.conf')
 log = logging.getLogger('LaH')
 
 fileHandler = logging.FileHandler('retrain.log')
 log.addHandler(fileHandler)
+
+# define ENV variables
+os.environ['MASTER_ADDR'] = '127.0.0.1'
+os.environ['MASTER_PORT'] = '10002'
 
 def make_model(src_vocab, tgt_vocab, N=6, 
 			   d_model=512, d_ff=2048, h=8, dropout=0.1):
@@ -55,6 +62,28 @@ def make_model(src_vocab, tgt_vocab, N=6,
 			nn.init.xavier_uniform(p)
 	return model
 
+'''
+src_cmd = templates.format(src_input_file,
+				pad_id,
+				bos_id,
+				eos_id,
+				unk_id,
+				src_prefix,
+				vocab_size,
+				character_coverage,
+				model_type)
+
+trg_cmd = templates.format(trg_input_file,
+				pad_id,
+				bos_id,
+				eos_id,
+				unk_id,
+				trg_prefix,
+				vocab_size,
+				character_coverage,
+				model_type)
+'''
+
 def set_padding(dataset_list):
 	# to list
 	src_token_list = [ds[0] for ds in dataset_list]
@@ -71,51 +100,101 @@ def set_padding(dataset_list):
 
 	return [src_token_tensor, trg_token_tensor, src_mask_tensor, trg_mask_tensor, ntokens]
 
-def greedy_decode(model, src, src_mask, max_len, start_symbol):
-    memory = model.encode(src, src_mask)
-    ys = torch.ones(1, 1).fill_(start_symbol).type_as(src.data)
-    for i in range(max_len-1):
-        out = model.decode(memory, src_mask, 
-                           Variable(ys), 
-                           Variable(subsequent_mask(ys.size(1))
-                                    .type_as(src.data)))
-        prob = model.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim = 1)
-        next_word = next_word.data[0]
-        ys = torch.cat([ys, 
-                        torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
-    return ys
+class TranslationDataset(Dataset):
+	def __init__(self, sent_pairs, src_spm, trg_spm):
+		self.dataset = sent_pairs
+		self.src_spm = src_spm
+		self.trg_spm = trg_spm
 
-def do_translate(valid_iter, model):
-	for i, batch in enumerate(valid_iter):
-		if i == 10:
-			break
-		src = batch.src.transpose(0, 1)[:1]
-		trg = batch.trg.transpose(0, 1)[:1]
-		print(src.shape)
-		print(src)
-		print(trg)
-		print('--------')
+	def __len__(self):
+		return len(self.dataset)
+	
+	def __getitem__(self, idx):
+		src, trg = self.dataset[idx]
+		
+		# to Tensor
+		inp_tensor = torch.LongTensor(self.src_spm.EncodeAsIds(src))#.unsqueeze(dim=0)
+		out_tensor = torch.LongTensor(self.trg_spm.EncodeAsIds(trg))#.unsqueeze(dim=0)
+		src_mask = (inp_tensor != self.src_spm.pad_id()).int()
+		trg_mask = (out_tensor != self.trg_spm.pad_id()).int()
+		ntokens = (out_tensor != self.trg_spm.pad_id()).data.sum()
+		
+		# to Variable
+		src_token = Variable(inp_tensor, requires_grad=False)
+		trg_token = Variable(out_tensor, requires_grad=False)
+		src_mask = Variable(src_mask, requires_grad=False)
+		trg_mask = Variable(trg_mask, requires_grad=False)
+		
+		return [src_token, trg_token, src_mask, trg_mask, ntokens]
 
-	'''
-		exit()
-		src_mask = (src != SRC.vocab.stoi['<pad>']).unsqueeze(-2)
-		out = greedy_decode(model, src, src_mask, 
-							max_len=60, start_symbol=TGT.vocab.stoi['<s>'])
-		print("Translation:", end="\t")
-		for i in range(1, out.size(1)):
-			sym = TGT.vocab.itos[out[0, i]]
-			if sym == "</s>": break
-			print(sym, end =" ")
-		print()
-		print("Target:", end="\t")
-		for i in range(1, batch.trg.size(0)):
-			sym = TGT.vocab.itos[batch.trg.data[i, 0]]
-			if sym == "</s>": break
-			print(sym, end =" ")
-		print()
-		break
-	'''
+def do_train(dataloader, model, loss_compute, epoch, lang):
+	# change model to train mode
+	model.train()
+
+	start = time.time()
+	total_tokens = 0
+	total_loss = 0
+	tokens = 0
+
+	inp_lang, out_lang = lang
+	with tqdm(dataloader, desc='training {}th epoch'.format(epoch)) as tbar:
+		for i, batch in enumerate(tbar):
+			# run model for training
+			out = model.forward(batch.src, batch.trg, batch.src_mask, batch.trg_mask)
+
+			# calculate loss
+			loss = loss_compute(out, batch.trg, batch.ntokens)
+			total_loss += loss
+			total_tokens += batch.ntokens
+			tokens += batch.ntokens
+
+			# print loss
+			if i % 50 == 1:
+				elapsed = time.time() - start
+				start = time.time()
+				tokens = 0
+		
+			# update tbar
+			tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
+
+def do_valid(dataloader, model, loss_compute, epoch):
+	# change model to validation mode
+	model.eval()
+
+	total_tokens = 0
+	total_loss = 0
+	tokens = 0
+	with tqdm(dataloader, desc='validating {}th epoch'.format(epoch)) as tbar:
+		for i, batch in enumerate(tbar):
+
+			# run model for training
+			out = model.forward(batch.src, batch.trg, batch.src_mask, batch.trg_mask)
+
+			# calculate loss
+			loss = loss_compute(out, batch.trg, batch.ntokens, do_backward=False)
+			total_loss += loss
+			total_tokens += batch.ntokens
+			tokens += batch.ntokens
+
+			# update tbar
+			tbar.set_postfix(loss=(total_loss/total_tokens).data.item())
+
+		return total_loss / total_tokens
+
+def do_save(model, optimizer, epoch, loss):
+	model_full_path = './models/model-tmp.bin'
+
+	# FIXME: fix model name
+	torch.save({
+		'epoch': epoch + 1,					  # need only for retraining
+		'state_dict': model.module.state_dict(),
+		'best_val_loss': loss,		  # need only for retraining
+		'optimizer' : optimizer.optimizer.state_dict(), # need only for retraining
+		'learning_rate' : optimizer._rate, # need only for retraining
+	}, model_full_path)
+
+	sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
+	log.info('model was saved at {} -> {:.4f}'.format(model_full_path, sum_of_weight))
 
 class LabelSmoothing(nn.Module):
 	"Implement label smoothing."
@@ -191,11 +270,31 @@ def trg_tokenize(x):
 def main():
 	args = parser.parse_args()
 
+	if args.multi_gpu:
+		ngpus_per_node = torch.cuda.device_count()
+	else:
+		ngpus_per_node = 1
+
+	args.world_size = ngpus_per_node
+	mp.spawn(main_worker, nprocs=ngpus_per_node, 
+			 args=(ngpus_per_node, args, ))
+
+def main_worker(gpu, ngpus_per_node, args):
+	global best_acc1
+	args.gpu = gpu
+	torch.cuda.set_device(args.gpu)
+
+	dist.init_process_group(backend='nccl', 
+							init_method='env://',
+							world_size=args.world_size,
+							rank=args.gpu)
+
 	# load dataset
 	#sent_pairs = load_dataset_aihub()
 	sent_pairs = load_dataset_aihub(path='data/')
 	random.seed(100)
 	random.shuffle(sent_pairs)
+	log.debug('GPU#{} seeding with {}'.format(args.gpu, args.gpu))
 
 	# make dataloader with dataset
 	# FIXME: RuntimeError: Internal: unk is not defined.
@@ -205,14 +304,23 @@ def main():
 
 	# split train/valid sentence pairs
 	n_train = int(len(sent_pairs) * 0.8)
+	n_split = int(n_train * 0.25)
+	train_sent_pairs = sent_pairs[:n_train]
+	log.info('train_sent_pairs: {}'.format(len(train_sent_pairs)))
+	train_sent_pairs = train_sent_pairs[:args.gpu*n_split] + train_sent_pairs[(args.gpu+1)*n_split:]
 	valid_sent_pairs = sent_pairs[n_train:]
+	train_sent_pairs = sorted(train_sent_pairs, key=lambda x: (len(x[0]), len(x[1])))
 	#log.info('train_sent_pairs: {}'.format(len(train_sent_pairs)))
 	log.info('valid_sent_pairs: {}'.format(len(valid_sent_pairs)))
 
 	# these are used for defining tokenize method and some reserved words
 	SRC = KRENField(
+		#tokenize=inp_lang.EncodeAsPieces, 
 		pad_token='<pad>')
 	TRG = KRENField(
+		#tokenize=out_lang.EncodeAsPieces, 
+		#init_token='<s>', 
+		#eos_token='</s>', 
 		pad_token='<pad>')
 
 	# load SRC/TRG
@@ -232,17 +340,19 @@ def main():
 		TRG.vocab = trg_vocab
 		log.info('input vocab was loaded: spm/{}.spm'.format(src_prefix))
 		log.info('output vocab was loaded: spm/{}.spm'.format(trg_prefix))
-
 	# define tokenizer
-	SRC.tokenize = src_tokenize
-	TRG.tokenize = trg_tokenize
+	#SRC.tokenize = src_tokenize
+	#TRG.tokenize = trg_tokenize
 
 	# make dataloader from KRENDataset
-	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang)
+	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang, encoding_type='pieces')
+	# output -> ['<s>', '▁', 'Central', '▁Asian', '▁c', 'u', 'is', ... '▁yesterday', '.', '</s>']
+	train_iter = MyIterator(train, batch_size=1024, device=0,
+                            repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
+                            batch_size_fn=batch_size_fn, train=True)
 	valid_iter = MyIterator(valid, batch_size=100, device=0,
                             repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
                             batch_size_fn=batch_size_fn, train=False)
-
 	# fix torch randomness
 	fix_torch_randomness()
 
@@ -254,18 +364,58 @@ def main():
 	# define model
 	model = make_model(args.inp_n_words, args.out_n_words)
 
-	# load model
-	model_name_full_path = './models/model-tmp.bin'
-	checkpoint = torch.load(model_name_full_path)
-	state_dict = checkpoint['state_dict']
-	model.load_state_dict(state_dict)
-	model.cuda()
+	# FIXME: need some good condition for multi distributed computing
+	if True:
+		model.cuda()
+		model = DDP(model, device_ids=[args.gpu])
+	exit()
 
-	sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
-	log.info('model was successfully loaded: {:.4f}'.format(sum_of_weight))
+	# define model
+	criterion = LabelSmoothing(size=args.out_n_words, padding_idx=0, smoothing=0.0)
+	# FIXME: need some good condition for multi distributed computing
+	if True:
+		criterion.cuda()
 
-	#(rebatch(pad_id, b) for b in valid_iter),
-	do_translate(valid_iter, model)
+	# define optimizer
+	optimizer = NoamOpt(
+			model_size=model.module.src_embed[0].d_model, 
+			factor=1, 
+			warmup=400,
+			optimizer=torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+
+	# initial best loss
+	best_val_loss = np.inf
+
+	# initialize visdom graph
+	vis_train = Visdom()
+	vis_valid = Visdom()
+
+	train_loss_list = []
+	valid_loss_list = []
+	for epoch in range(args.epochs):
+		train_losses = do_train((rebatch(pad_id, b) for b in train_iter),
+				model,
+				SimpleLossCompute(model.module.generator, criterion, opt=optimizer),
+				epoch,
+				(SRC, TRG))
+		valid_loss = do_valid((rebatch(pad_id, b) for b in valid_iter),
+				model,
+				SimpleLossCompute(model.module.generator, criterion, opt=optimizer),
+				epoch)
+
+		if args.gpu == 0:
+			if valid_loss >= best_val_loss:
+				log.info('Try again. Current best is still {:.4f}'.format(best_val_loss))
+			else:
+				log.info('New record. from {:.4f} to {:.4f}'.format(best_val_loss, valid_loss))
+				best_val_loss = valid_loss
+				do_save(model, optimizer, epoch, best_val_loss)
+	train_loss_list = np.array(train_loss_list)
+	valid_loss_list = np.array(valid_loss_list)
+
+	# draw visdom graph
+	vis_train.line(Y=train_loss_list, X=np.arange(len(train_loss_list))*50)
+	vis_valid.line(Y=valid_loss_list, X=np.arange(len(valid_loss_list)))
 
 if __name__ == '__main__':
 	main()
