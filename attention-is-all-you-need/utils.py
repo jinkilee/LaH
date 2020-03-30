@@ -6,8 +6,9 @@ def fix_torch_randomness(seed=0):
 	if torch.cuda.is_available():
 		torch.cuda.manual_seed_all(seed)
 
-def to_gpu(batch, device):
-	return list(map(lambda b: b.to(device), batch))
+def to_gpu(batch):
+	return list(map(lambda b: b.cuda(), batch))
+	#return list(map(lambda b: b.to(device), batch))
 
 def get_sentencepiece(src_prefix, trg_prefix, src_cmd=None, trg_cmd=None, make_sentencepiece=False):
 	if make_sentencepiece:
