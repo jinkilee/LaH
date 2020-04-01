@@ -1,5 +1,6 @@
 import sentencepiece as spm
 import torch
+from functools import reduce
 
 def fix_torch_randomness(seed=0):
 	torch.manual_seed(seed)
@@ -30,3 +31,8 @@ def get_sentencepiece(src_prefix, trg_prefix, src_cmd=None, trg_cmd=None, make_s
 
 	return src_spm, trg_spm
 
+def get_number_of_params(model):
+	n_params = 0
+	for parameter in model.parameters():
+		n_params += reduce(lambda x, y: x*y, parameter.shape)
+	return n_params

@@ -22,7 +22,7 @@ from collections import Counter
 exclude = set(string.punctuation) # Set of all special characters
 remove_digits = str.maketrans('', '', string.digits) # Set of all digits
 
-MIN, MAX = 3, 30
+MIN, MAX = 3, 60
 
 def subsequent_mask(size):
 	"Mask out subsequent positions."
@@ -62,8 +62,8 @@ class KRENDataset(TranslationDataset):
 			fields = [('src', fields[0]), ('trg', fields[1])]
 
 		sent_pairs = list(filter(lambda x: len(x[0])*len(x[1]) != 0, sent_pairs))
-		sent_pairs = list(filter(lambda x: len(x[0]) > MIN and len(x[0]) > MIN, sent_pairs))
-		sent_pairs = list(filter(lambda x: len(x[1]) > MIN and len(x[1]) > MAX, sent_pairs))
+		sent_pairs = list(filter(lambda x: MIN <= len(x[0]) and len(x[0]) <= MAX, sent_pairs))
+		sent_pairs = list(filter(lambda x: MIN <= len(x[1]) and len(x[1]) <= MAX, sent_pairs))
 
 		if encoding_type == 'ids':
 			inp_encoding = inp_lang.EncodeAsIds
@@ -186,7 +186,7 @@ def preprocess_eng_sentence(sent, add_bos_eos=False):
 		sent = '<bos> ' + sent + ' <eos>'
 	return sent
 
-def load_dataset_aihub(path='../dataset/aihub'):
+def load_dataset_aihub(path='../dataset/aihub', seed=100):
 	sent_pairs = []
 	for f in os.listdir(path):
 		one_df = pd.read_excel(os.path.join(path, f))
@@ -201,6 +201,8 @@ def load_dataset_aihub(path='../dataset/aihub'):
 			'REVIEW':'label',
 		})
 		sent_pairs.extend(one_df[['kor','label']].values.tolist())
+	random.seed(seed)
+	random.shuffle(sent_pairs)
 	return sent_pairs
 
 def load_dataset_kaist(path):

@@ -6,62 +6,36 @@ import dill
 import random
 import glob
 import setting
+import torch
 import numpy as np
 import sentencepiece as spm
 import argparse
 import torch.distributed as dist
-import torch.multiprocessing as mp
+#import torch.multiprocessing as mp
 import logging
 import logging.config
 
 from visdom import Visdom
-from tqdm import tqdm, trange
-from loss_compute import SimpleLossCompute, MultiGPULossCompute, MultiGPULossCompute_
 from utils import fix_torch_randomness, get_sentencepiece 
-from transformer import *
-from dataset import load_dataset_aihub, KRENDataset, KRENField, MyIterator, batch_size_fn, rebatch
+from transformer import make_model, subsequent_mask
+from dataset import load_dataset_aihub, KRENDataset, KRENField, MyIterator, batch_size_fn 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.autograd import Variable
-from torch.utils.data import DataLoader, TensorDataset, Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.utils.rnn import pad_sequence
 from setting import *
 from feature import *
-from optimizer import NoamOpt
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 # define logger 
 logging.config.fileConfig('logging.conf')
 log = logging.getLogger('LaH')
 
-fileHandler = logging.FileHandler('retrain.log')
+fileHandler = logging.FileHandler('evaluate.log')
 log.addHandler(fileHandler)
 
 # define ENV variables
 os.environ['MASTER_ADDR'] = '127.0.0.1'
 os.environ['MASTER_PORT'] = '10002'
-
-def make_model(src_vocab, tgt_vocab, N=6, 
-			   d_model=512, d_ff=2048, h=8, dropout=0.1):
-	"Helper: Construct a model from hyperparameters."
-	c = copy.deepcopy
-	attn = MultiHeadedAttention(h, d_model)
-	ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-	position = PositionalEncoding(d_model, dropout)
-	model = EncoderDecoder(
-		Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-		Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
-		nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
-		nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
-		Generator(d_model, tgt_vocab))
-	
-	# This was important from their code. 
-	# Initialize parameters with Glorot / fan_avg.
-	for p in model.parameters():
-		if p.dim() > 1:
-			nn.init.xavier_uniform(p)
-	return model
 
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
@@ -74,45 +48,10 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 									.type_as(src.data)))
 		prob = model.generator(out[:, -1])
 		_, next_word = torch.max(prob, dim = 1)
-		next_word = next_word.data[0]
-		print(i, next_word)
+		next_word = next_word.item()
 		ys = torch.cat([ys, 
 						torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
 	return ys
-
-def do_translate(dataloader, model, lang):
-	# change model to validation mode
-	model.eval()
-
-	total_tokens = 0
-	total_loss = 0
-	tokens = 0
-	SRC, TRG = lang
-	with tqdm(dataloader, desc='translating') as tbar:
-		for i, batch in enumerate(tbar):
-			# run model for training
-			#batch.src = batch.src
-			#batch.src_mask = (batch.src != SRC.vocab.stoi['<pad>'])
-
-			# to cuda
-			#batch.src = batch.src.cuda()
-			#batch.src_mask = batch.src_mask.cuda()
-			#print(batch.src.shape, batch.src_mask.shape)
-			#ids = batch.src.cpu().numpy().tolist()[0]
-			#log.debug('translated: {}'.format(list(map(lambda x: SRC.vocab.stoi[x], ids))))
-			#src = Variable(torch.LongTensor([[1,2,3,4,5,6,7,8,9,10]])).cuda()
-			#src_mask = Variable(torch.ones(1, 1, 10)).cuda()
-			#print(src.shape, src_mask.shape)
-			#ys = greedy_decode(model, batch.src, batch.src_mask.transpose(0, 1), 60, SRC.vocab.stoi['<s>'])
-			src = torch.LongTensor(batch.src).unsqueeze(dim=0)
-			src_mask = (src != SRC.vocab.stoi['<s>']).unsqueeze(dim=0)
-			#src_mask = (src != SRC.vocab.stoi['<pad>']).unsqueeze(dim=0)
-			print(src)
-			print(src_mask)
-			exit()
-			ys = greedy_decode(model, src.cuda(), src_mask.cuda(), 60, SRC.vocab.stoi['<s>'])
-			log.debug('ys: {}'.format(ys))
-			break
 
 def do_save(model, optimizer, epoch, loss):
 	model_full_path = './models/model-tmp.bin'
@@ -129,76 +68,10 @@ def do_save(model, optimizer, epoch, loss):
 	sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
 	log.info('model was saved at {} -> {:.4f}'.format(model_full_path, sum_of_weight))
 
-class LabelSmoothing(nn.Module):
-	"Implement label smoothing."
-	def __init__(self, size, padding_idx, smoothing=0.0):
-		super(LabelSmoothing, self).__init__()
-		self.criterion = nn.KLDivLoss(size_average=False)
-		self.padding_idx = padding_idx
-		self.confidence = 1.0 - smoothing
-		self.smoothing = smoothing
-		self.size = size
-		self.true_dist = None
-		
-	def forward(self, x, target):
-		assert x.size(1) == self.size
-		true_dist = x.data.clone()
-		true_dist.fill_(self.smoothing / (self.size - 2))
-		true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-		true_dist[:, self.padding_idx] = 0
-		mask = torch.nonzero(target.data == self.padding_idx)
-		if mask.dim() > 0:
-			true_dist.index_fill_(0, mask.squeeze(), 0.0)
-		self.true_dist = true_dist
-		return self.criterion(x, Variable(true_dist, requires_grad=False))
-
-
-class SimpleLossCompute:
-	"A simple loss compute and train function."
-	def __init__(self, generator, criterion, opt=None):
-		self.generator = generator
-		self.criterion = criterion
-		self.opt = opt
-		
-	def __call__(self, x, y, norm, do_backward=True):
-		x = self.generator(x)
-		a = self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1))
-		loss = self.criterion(x.contiguous().view(-1, x.size(-1)), 
-							  y.contiguous().view(-1)) / norm
-		if not do_backward:
-			return loss.data.item() * norm.float()
-
-		if self.opt is not None:
-			self.opt.step()
-			self.opt.optimizer.zero_grad()
-		loss.backward()
-		return loss.data.item() * norm.float()
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--world_size', default=setting.world_size, type=int)
 parser.add_argument('--multi_gpu', default=setting.multi_gpu, type=bool)
 parser.add_argument('--epochs', default=45, type=int)
-#parser.add_argument('--n_words', default=setting.n_words, type=int)
-
-# define tokenizer
-def src_tokenize(x):
-	tokens = [SRC.vocab.stoi['<unk>']] * len(x)
-	for i, xi in enumerate(x):
-		try:
-			tokens[i] = xi
-		except KeyError:
-			pass
-	return tokens
-
-def trg_tokenize(x):
-	tokens = [TRG.vocab.stoi['<unk>']] * len(x)
-	print(tokens)
-	for i, xi in enumerate(x):
-		try:
-			tokens[i] = xi
-		except KeyError:
-			pass
-	return tokens
 
 def main():
 	args = parser.parse_args()
@@ -206,8 +79,8 @@ def main():
 	# load dataset
 	#sent_pairs = load_dataset_aihub()
 	sent_pairs = load_dataset_aihub(path='data/')
-	random.seed(100)
-	random.shuffle(sent_pairs)
+	#random.seed(100)
+	#random.shuffle(sent_pairs)
 
 	# make dataloader with dataset
 	# FIXME: RuntimeError: Internal: unk is not defined.
@@ -221,14 +94,8 @@ def main():
 	log.info('valid_sent_pairs: {}'.format(len(valid_sent_pairs)))
 
 	# these are used for defining tokenize method and some reserved words
-	SRC = KRENField(
-		#tokenize=inp_lang.EncodeAsPieces, 
-		pad_token='<pad>')
-	TRG = KRENField(
-		#tokenize=out_lang.EncodeAsPieces, 
-		#init_token='<s>', 
-		#eos_token='</s>', 
-		pad_token='<pad>')
+	SRC = KRENField(pad_token='<pad>')
+	TRG = KRENField(pad_token='<pad>')
 
 	# load SRC/TRG
 	if not os.path.exists('spm/{}.model'.format(src_prefix)) or \
@@ -247,12 +114,9 @@ def main():
 		TRG.vocab = trg_vocab
 		log.info('input vocab was loaded: spm/{}.spm'.format(src_prefix))
 		log.info('output vocab was loaded: spm/{}.spm'.format(trg_prefix))
-	# define tokenizer
-	#SRC.tokenize = src_tokenize
-	#TRG.tokenize = trg_tokenize
 
 	# make dataloader from KRENDataset
-	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang, encoding_type='ids')
+	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang, encoding_type='pieces')
 	valid_iter = MyIterator(valid, batch_size=100, device=0,
 							repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
 							batch_size_fn=batch_size_fn, train=False)
@@ -273,11 +137,31 @@ def main():
 	model.load_state_dict(state_dict)
 	model.cuda()
 
-	do_translate(
-		valid,
-		#(rebatch(pad_id, b) for b in valid_iter),
-		model,
-		(SRC, TRG))
+	for i, batch in enumerate(valid_iter):
+		src = batch.src.transpose(0, 1)[:1]
+		src_mask = (src != SRC.vocab.stoi["<pad>"]).unsqueeze(-2)
+		print("Input::", end="\t")
+		for i in range(src.size(1)):
+			sym = SRC.vocab.itos[src[0, i]]
+			if sym == "</s>": break
+			print(sym, end =" ")
+		print('')
+		
+		out = greedy_decode(model, src.cuda(), src_mask.cuda(), 
+							max_len=60, start_symbol=TRG.vocab.stoi["<s>"])
+		print("Translation:", end="\t")
+		for i in range(1, out.size(1)):
+			sym = TRG.vocab.itos[out[0, i]]
+			if sym == "</s>": break
+			print(sym, end =" ")
+		print('')
+		print("Target:", end="\t")
+		for i in range(1, batch.trg.size(0)):
+			sym = TRG.vocab.itos[batch.trg.data[i, 0]]
+			if sym == "</s>": break
+			print(sym, end =" ")
+		print('')
+		print('---------------')
 
 if __name__ == '__main__':
 	main()

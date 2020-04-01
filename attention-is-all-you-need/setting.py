@@ -20,5 +20,20 @@ character_coverage = 1.0 # to reduce character set
 model_type ='unigram' # Choose from unigram (default), bpe, char, or word
 
 MIN_FREQ = 2
-multi_gpu=True
-world_size=4
+multi_gpu = True
+world_size = 4
+n_save = 25
+
+model_path = './models'
+
+d_model = 1024
+d_ff = 4096
+h = 16
+dropout = 0.3
+N = 6
+epochs = 45
+train_batch_size = 2048
+valid_batch_size = 1024
+
+
+
