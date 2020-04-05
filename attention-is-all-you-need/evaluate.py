@@ -53,25 +53,16 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 						torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
 	return ys
 
-def do_save(model, optimizer, epoch, loss):
-	model_full_path = './models/model-tmp.bin'
-
-	# FIXME: fix model name
-	torch.save({
-		'epoch': epoch + 1,					  # need only for retraining
-		'state_dict': model.module.state_dict(),
-		'best_val_loss': loss,		  # need only for retraining
-		'optimizer' : optimizer.optimizer.state_dict(), # need only for retraining
-		'learning_rate' : optimizer._rate, # need only for retraining
-	}, model_full_path)
-
-	sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
-	log.info('model was saved at {} -> {:.4f}'.format(model_full_path, sum_of_weight))
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--world_size', default=setting.world_size, type=int)
 parser.add_argument('--multi_gpu', default=setting.multi_gpu, type=bool)
-parser.add_argument('--epochs', default=45, type=int)
+parser.add_argument('--modelnm', default='a.bin', type=str)
+parser.add_argument('--N', default=setting.N, type=int)
+parser.add_argument('--d_model', default=setting.d_model, type=int)
+parser.add_argument('--d_ff', default=setting.d_ff, type=int)
+parser.add_argument('--h', default=setting.h, type=int)
+parser.add_argument('--dropout', default=0.0, type=float)
+parser.add_argument('--small_model', default=False, type=bool)
 
 def main():
 	args = parser.parse_args()
@@ -129,14 +120,29 @@ def main():
 	log.info('inp_n_words: {} out_n_words: {}'.format(args.inp_n_words, args.out_n_words))
 
 	# define model
-	model = make_model(args.inp_n_words, args.out_n_words)
+	if args.small_model:
+		model = make_model(
+			args.inp_n_words, 
+			args.out_n_words,
+			dropout=args.dropout)
+	else:
+		model = make_model(
+			args.inp_n_words, 
+			args.out_n_words,
+			N=N,
+			d_model=args.d_model,
+			d_ff=args.d_ff,
+			h=args.h,
+			dropout=args.dropout)
 
-	model_name_full_path = './models/model-tmp.bin'
+	#model_name_full_path = './models/model-tmp.bin'
+	model_name_full_path = args.modelnm
 	checkpoint = torch.load(model_name_full_path)
 	state_dict = checkpoint['state_dict']
 	model.load_state_dict(state_dict)
 	model.cuda()
-
+	
+	model.eval()
 	for i, batch in enumerate(valid_iter):
 		src = batch.src.transpose(0, 1)[:1]
 		src_mask = (src != SRC.vocab.stoi["<pad>"]).unsqueeze(-2)

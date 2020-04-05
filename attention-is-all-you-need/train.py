@@ -23,7 +23,6 @@ from transformer import make_model
 from dataset import load_dataset_aihub, KRENDataset, KRENField, MyIterator, batch_size_fn, rebatch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.autograd import Variable
-from torch.utils.data import DataLoader, TensorDataset, Dataset
 from setting import *
 from feature import *
 from optimizer import NoamOpt, get_std_opt
@@ -57,6 +56,12 @@ def save_model(args, model, optimizer, epoch, loss, model_name='model-tmp.bin'):
 	sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
 	log.info('model was saved at {} -> {:.4f}'.format(model_full_path, sum_of_weight))
 
+def average_gradients(model):
+	size = float(dist.get_world_size())
+	for param in model.parameters():
+		dist.all_reduce(param.grad.data, op=dist.reduce_op.SUM)
+		param.grad.data /= size
+
 def train_epoch(train_iter, model, criterion, model_opt, epoch):
 	"Standard Training and Logging Function"
 	losses = []
@@ -75,6 +80,7 @@ def train_epoch(train_iter, model, criterion, model_opt, epoch):
 				trg[:, 1:], 
 				batch.ntokens) 
 							
+			average_gradients(model)
 			model_opt.step()
 			model_opt.optimizer.zero_grad()
 			tbar.set_postfix(loss=loss)
@@ -84,6 +90,7 @@ def train_epoch(train_iter, model, criterion, model_opt, epoch):
 				total_count = 0
 			total_loss += loss
 			total_count += 1
+
 	return losses
 
 def valid_epoch(valid_iter, model, criterion, epoch):
@@ -133,6 +140,7 @@ parser.add_argument('--dropout', default=setting.dropout, type=float)
 parser.add_argument('--train_batch_size', default=setting.train_batch_size, type=int)
 parser.add_argument('--valid_batch_size', default=setting.valid_batch_size, type=int)
 parser.add_argument('--model_path', default=setting.model_path, type=str)
+parser.add_argument('--local_rank', type=int)
 
 def main():
 	args = parser.parse_args()
@@ -143,12 +151,12 @@ def main():
 		ngpus_per_node = 1
 
 	args.world_size = ngpus_per_node
-	mp.spawn(main_worker, nprocs=ngpus_per_node, 
-			 args=(ngpus_per_node, args, ))
+	#mp.spawn(main_worker, nprocs=ngpus_per_node, 
+			 #args=(ngpus_per_node, args, ))
 
-def main_worker(gpu, ngpus_per_node, args):
+#def main_worker(gpu, ngpus_per_node, args):
 	global best_acc1
-	args.gpu = gpu
+	args.gpu = args.local_rank
 	torch.cuda.set_device(args.gpu)
 
 	dist.init_process_group(backend='nccl', 
@@ -204,6 +212,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
 	# make dataloader from KRENDataset
 	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang, encoding_type='pieces')
+
 	# output -> ['<s>', '▁', 'Central', '▁Asian', '▁c', 'u', 'is', ... '▁yesterday', '.', '</s>']
 	train_iter = MyIterator(train, batch_size=args.train_batch_size, device=0,
 							repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
@@ -229,20 +238,22 @@ def main_worker(gpu, ngpus_per_node, args):
 		h=args.h,
 		dropout=args.dropout)
 	log.info('number of model parameters: {}'.format(get_number_of_params(model)))
-	model_opt = get_std_opt(model)
+	optimizer = get_std_opt(model)
 	model.cuda()
 	model = DDP(model, device_ids=[args.gpu])
 
 	# define model
-	criterion = LabelSmoothing(size=args.out_n_words, padding_idx=0, smoothing=0.0)
+	criterion = LabelSmoothing(size=args.out_n_words, padding_idx=0, smoothing=0.1)
 	criterion.cuda()
 
+	'''
 	# define optimizer
 	optimizer = NoamOpt(
 			model_size=model.module.src_embed[0].d_model, 
 			factor=2, 
 			warmup=4000,
 			optimizer=torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+	'''
 
 	# initial best loss
 	best_val_loss = np.inf
@@ -274,7 +285,7 @@ def main_worker(gpu, ngpus_per_node, args):
 			(rebatch(pad_id, b) for b in train_iter), 
 			model.module, 
 			criterion, 
-			model_opt, 
+			optimizer, 
 			epoch)
 		valid_loss = valid_epoch(
 			(rebatch(pad_id, b) for b in valid_iter), 
@@ -285,9 +296,12 @@ def main_worker(gpu, ngpus_per_node, args):
 		train_loss_list.extend(train_losses)
 		valid_loss_list.append(valid_loss)
 
+		sum_of_weight = sum([p[1].data.sum() for p in model.named_parameters()])
+		log.info('GPU{} -> sum_of_weight={:.4f}'.format(args.gpu, sum_of_weight))
+
 		if args.gpu == 0:
 			if valid_loss >= best_val_loss:
-				log.info('Try again. Current best is still {:.4f}'.format(best_val_loss))
+				log.info('Try again. Current best is still {:.4f} (< {:.4f})'.format(best_val_loss, valid_loss))
 			else:
 				log.info('New record. from {:.4f} to {:.4f}'.format(best_val_loss, valid_loss))
 				best_val_loss = valid_loss
