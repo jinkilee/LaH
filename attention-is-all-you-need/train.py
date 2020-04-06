@@ -151,10 +151,7 @@ def main():
 		ngpus_per_node = 1
 
 	args.world_size = ngpus_per_node
-	#mp.spawn(main_worker, nprocs=ngpus_per_node, 
-			 #args=(ngpus_per_node, args, ))
 
-#def main_worker(gpu, ngpus_per_node, args):
 	global best_acc1
 	args.gpu = args.local_rank
 	torch.cuda.set_device(args.gpu)
@@ -177,15 +174,18 @@ def main():
 
 	# split train/valid sentence pairs
 	n_train = int(len(sent_pairs) * 0.8)
-	n_split = int(n_train * 0.25)
+	n_split = int(n_train * 1./args.world_size)
+	print(n_split*args.gpu, n_split*(args.gpu+1))
+
 	train_sent_pairs = sent_pairs[:n_train]
-	random.seed(100+args.gpu)
-	random.shuffle(train_sent_pairs)
-	log.info('train_sent_pairs: {}'.format(len(train_sent_pairs)))
-	train_sent_pairs = train_sent_pairs[:args.gpu*n_split] + train_sent_pairs[(args.gpu+1)*n_split:]
-	valid_sent_pairs = sent_pairs[n_train:]
+	log.info('train_sent_pairs before split: {}'.format(len(train_sent_pairs)))
+
+	# split train datset by GPU
+	train_sent_pairs = train_sent_pairs[n_split*args.gpu:n_split*(args.gpu+1)]
 	train_sent_pairs = sorted(train_sent_pairs, key=lambda x: (len(x[0]), len(x[1])))
-	log.info('train_sent_pairs: {}'.format(len(train_sent_pairs)))
+	log.info('train_sent_pairs after split: {} --> GPU:{}'.format(len(train_sent_pairs), args.gpu))
+
+	valid_sent_pairs = sent_pairs[n_train:]
 	log.info('valid_sent_pairs: {}'.format(len(valid_sent_pairs)))
 
 	# these are used for defining tokenize method and some reserved words
@@ -245,15 +245,6 @@ def main():
 	# define model
 	criterion = LabelSmoothing(size=args.out_n_words, padding_idx=0, smoothing=0.1)
 	criterion.cuda()
-
-	'''
-	# define optimizer
-	optimizer = NoamOpt(
-			model_size=model.module.src_embed[0].d_model, 
-			factor=2, 
-			warmup=4000,
-			optimizer=torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
-	'''
 
 	# initial best loss
 	best_val_loss = np.inf

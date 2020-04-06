@@ -178,14 +178,17 @@ def main():
 	# split train/valid sentence pairs
 	n_train = int(len(sent_pairs) * 0.8)
 	n_split = int(n_train * 0.25)
+	print(n_split*args.gpu, n_split*(args.gpu+1))
+
 	train_sent_pairs = sent_pairs[:n_train]
-	random.seed(100+args.gpu)
-	random.shuffle(train_sent_pairs)
-	log.info('train_sent_pairs: {}'.format(len(train_sent_pairs)))
-	train_sent_pairs = train_sent_pairs[:args.gpu*n_split] + train_sent_pairs[(args.gpu+1)*n_split:]
-	valid_sent_pairs = sent_pairs[n_train:]
+	log.info('train_sent_pairs before split: {}'.format(len(train_sent_pairs)))
+
+	# split train datset by GPU
+	train_sent_pairs = train_sent_pairs[n_split*args.gpu:n_split*(args.gpu+1)]
 	train_sent_pairs = sorted(train_sent_pairs, key=lambda x: (len(x[0]), len(x[1])))
-	log.info('train_sent_pairs: {}'.format(len(train_sent_pairs)))
+	log.info('train_sent_pairs jfter split: {} --> GPU:{}'.format(len(train_sent_pairs), args.gpu))
+
+	valid_sent_pairs = sent_pairs[n_train:]
 	log.info('valid_sent_pairs: {}'.format(len(valid_sent_pairs)))
 
 	# these are used for defining tokenize method and some reserved words
