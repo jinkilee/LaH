@@ -32,5 +32,5 @@ h = 16
 dropout = 0.3
 N = 6
 epochs = 45
-train_batch_size = 1600 # 4000
+train_batch_size = 4000
 valid_batch_size = 1024
