@@ -4,7 +4,7 @@ env_las
 data
 korean-parallel-corpora/korean-english-news-v1/training_checkpoints
 #dataset
-**/*.model
+#**/*.model
 **/*.vocab
 **/*.txt
 **/*.out
