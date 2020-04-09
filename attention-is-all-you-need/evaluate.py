@@ -37,6 +37,12 @@ log.addHandler(fileHandler)
 os.environ['MASTER_ADDR'] = '127.0.0.1'
 os.environ['MASTER_PORT'] = '10002'
 
+def encoding_decoding_test(datafield, txt):
+	ids = datafield.tokenize(txt)
+	dec = datafield.detokenize(ids)
+	log.debug(txt)
+	log.debug(ids)
+	log.debug(dec)
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
 	memory = model.encode(src, src_mask)
@@ -106,11 +112,21 @@ def main():
 		log.info('input vocab was loaded: spm/{}.spm'.format(src_prefix))
 		log.info('output vocab was loaded: spm/{}.spm'.format(trg_prefix))
 
+	SRC.tokenize = inp_lang.EncodeAsIds
+	TRG.tokenize = out_lang.EncodeAsIds
+	SRC.detokenize = inp_lang.DecodeIds
+	TRG.detokenize = out_lang.DecodeIds
+
 	# make dataloader from KRENDataset
+	#train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang, encoding_type='ids')
 	train, valid, test = KRENDataset.splits(sent_pairs, (SRC, TRG), inp_lang, out_lang, encoding_type='pieces')
 	valid_iter = MyIterator(valid, batch_size=100, device=0,
 							repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
 							batch_size_fn=batch_size_fn, train=False)
+	#encoding_decoding_test(SRC, sent_pairs[0][0])
+	#encoding_decoding_test(TRG, sent_pairs[0][1])
+
+
 	# fix torch randomness
 	fix_torch_randomness()
 
@@ -146,24 +162,35 @@ def main():
 	for i, batch in enumerate(valid_iter):
 		src = batch.src.transpose(0, 1)[:1]
 		src_mask = (src != SRC.vocab.stoi["<pad>"]).unsqueeze(-2)
+		print(SRC.detokenize(src.numpy()[0].tolist()))
 		print("Input::", end="\t")
 		for i in range(src.size(1)):
-			sym = SRC.vocab.itos[src[0, i]]
+			sym = SRC.vocab.itos[src[0, i].data.item()]
 			if sym == "</s>": break
 			print(sym, end =" ")
 		print('')
 		
 		out = greedy_decode(model, src.cuda(), src_mask.cuda(), 
 							max_len=60, start_symbol=TRG.vocab.stoi["<s>"])
-		print("Translation:", end="\t")
+		print("Translation with TRG:", end="\t")
 		for i in range(1, out.size(1)):
-			sym = TRG.vocab.itos[out[0, i]]
+			sym = TRG.vocab.itos[out[0, i].data.item()]
 			if sym == "</s>": break
 			print(sym, end =" ")
 		print('')
+
+		print("Translation with tokenize:", end="\t")
+		out_list = []
+		for i in range(1, out.size(1)):
+			sym = out[0, i].data.item()
+			if sym == TRG.vocab.stoi['</s>']:
+				break
+			out_list.append(sym)
+		print(TRG.detokenize(out_list))
+
 		print("Target:", end="\t")
 		for i in range(1, batch.trg.size(0)):
-			sym = TRG.vocab.itos[batch.trg.data[i, 0]]
+			sym = TRG.vocab.itos[batch.trg.data[i, 0].item()]
 			if sym == "</s>": break
 			print(sym, end =" ")
 		print('')

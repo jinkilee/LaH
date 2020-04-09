@@ -2,10 +2,10 @@
 #templates= '--input={} --model_prefix={} --vocab_size={} --character_coverage={} --model_type={}'
 templates= '--input={} --pad_id={} --bos_id={} --eos_id={} --unk_id={} --model_prefix={} --vocab_size={} --character_coverage={} --model_type={}'
 
-pad_id = 1  #<pad> token을 0으로 설정
-bos_id = 3 #<start> token을 1으로 설정
+pad_id = 0 #<pad> token을 0으로 설정
+bos_id = 1 #<start> token을 1으로 설정
 eos_id = 2 #<end> token을 2으로 설정
-unk_id = 0 #<unknown> token을 3으로 설정
+unk_id = 3 #<unknown> token을 3으로 설정
 
 src_vocab_size = 50000 # vocab 사이즈
 trg_vocab_size = 32000 # vocab 사이즈

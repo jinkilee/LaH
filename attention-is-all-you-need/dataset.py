@@ -298,7 +298,7 @@ def subsequent_mask(size):
 	return torch.from_numpy(subsequent_mask) == 0
 
 class KRENField(data.Field):
-	def build_vocab(self, dataset, **kwargs):
+	def build_vocab(self, dataset, spm_vocab_filename, **kwargs):
 		'''
 			This function has to make `self.vocab` which has the following properties.
 			- freqs
@@ -313,6 +313,14 @@ class KRENField(data.Field):
 			counter.update(d)
 		self.vocab = Vocab(counter, specials=['<pad>','<s>','</s>','<unk>'])
 
+		# edit itos
+		itos = {}
+		with open(spm_vocab_filename, 'r') as f:
+			for line_num,line in enumerate(f):
+				itos[line_num] = line.split("\t")[0]
+		stoi = {v:k for k,v in itos.items()}
+		self.vocab.itos = itos
+		self.vocab.stoi = stoi
 
 class MyIterator(data.Iterator):
 	def create_batches(self):
