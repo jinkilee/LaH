@@ -172,8 +172,8 @@ def main():
 							rank=args.gpu)
 
 	# load dataset
-	#sent_pairs = load_dataset_aihub(path='data/')
-	sent_pairs = load_dataset_aihub()
+	sent_pairs = load_dataset_aihub(path='data/')
+	#sent_pairs = load_dataset_aihub()
 	log.debug('GPU#{} seeding with {}'.format(args.gpu, args.gpu))
 
 	# make dataloader with dataset
