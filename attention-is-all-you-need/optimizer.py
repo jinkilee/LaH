@@ -1,10 +1,12 @@
 import torch
 from torch.optim import Optimizer
+from apex.optimizers import FusedAdam
 
 class NoamOpt(Optimizer):
 	"Optim wrapper that implements rate."
 	def __init__(self, model_size, factor, warmup, optimizer):
 		self.optimizer = optimizer
+		self.param_groups = self.optimizer.param_groups
 		self._step = 0
 		self.warmup = warmup
 		self.factor = factor
@@ -24,11 +26,22 @@ class NoamOpt(Optimizer):
 		"Implement `lrate` above"
 		if step is None:
 			step = self._step
-		return self.factor *			 (self.model_size ** (-0.5) *
+		return self.factor * (self.model_size ** (-0.5) *
 			min(step ** (-0.5), step * self.warmup ** (-1.5)))
 		
-def get_std_opt(model, lr=0):
-	return NoamOpt(model.src_embed[0].d_model, 2, 4000,
-			torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9))
+def get_std_opt(model, fp16, lr=0):
+	if fp16:
+		opt = FusedAdam(
+				model.parameters(),
+				lr=lr,
+				betas=(0.9, 0.98),
+				eps=1e-9,
+				bias_correction=False)
+	else:
+		opt = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9)
 
-
+	return NoamOpt(
+			model_size=model.src_embed[0].d_model,
+			factor=1,
+			warmup=2000,
+			optimizer=opt)
